@@ -1042,10 +1042,24 @@ class H3JointConditioning:
             "required": {
                 "layout": (wt.JOINT, {"tooltip": "From H3 Join Latents."}),
             },
+            "optional": {
+                "vae": ("VAE", {"tooltip": "Video VAE. With width and height, "
+                                "re-encodes each clip's image keyframes from their "
+                                "original image files at that resolution."}),
+                "width": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 16,
+                                  "tooltip": "Width of the upscaled video the "
+                                             "sampler refines. 0 keeps the saved keyframes."}),
+                "height": ("INT", {"default": 0, "min": 0, "max": 8192, "step": 16,
+                                   "tooltip": "Height of the upscaled video the "
+                                              "sampler refines. 0 keeps the saved keyframes."}),
+            },
         }
 
-    def build(self, layout):
-        table = build_table(layout, condload.load_for_clip)
+    def build(self, layout, vae=None, width=0, height=0):
+        load = condload.load_for_clip
+        if vae is not None and width > 0 and height > 0:
+            load = lambda path: _source_keyframes(condload.load_for_clip(path), path, vae, width, height)
+        table = build_table(layout, load)
         # the first clip's entries carry the table; without a window
         # handler the sampler simply runs under the first clip
         out = []
@@ -1069,6 +1083,83 @@ def _without_table(cond):
             out.append([entry[0], extras])
         else:
             out.append(entry)
+    return out
+
+
+_SAVE_NODES = ("H3SaveVideoWithMCtx", "H3TrimAndSaveVideoWithMCtx", "H3SaveMCtxForVideo")
+
+
+def _keyframe_images(prompt, raw_frames):
+    """{frame: (image file, crop)} for the single-image keyframes a take's
+    prompt added on the conditioning its save node got: AddGuide images and
+    first/last frames, where the image comes straight from a loader with an
+    `image` file input (LoadImage, LoadAndResizeImage, ...). The crop is the
+    one the core node used to fit it."""
+    import folder_paths
+
+    def image_file(link):
+        if not isinstance(link, list) or link[0] not in prompt:
+            return None
+        name = prompt[link[0]].get("inputs", {}).get("image")
+        if isinstance(name, str) and folder_paths.exists_annotated_filepath(name):
+            return name
+        return None
+
+    out = {}
+    for node in prompt.values():
+        if node.get("class_type") not in _SAVE_NODES:
+            continue
+        link = node.get("inputs", {}).get("conditioning")
+        while isinstance(link, list) and link[0] in prompt:
+            n = prompt[link[0]]
+            ins = n.get("inputs", {})
+            found = []
+            if n.get("class_type") == "MiniMaxH3AddGuide" and isinstance(ins.get("frame_idx"), int):
+                f = ins["frame_idx"]
+                found.append((f if f >= 0 else raw_frames + f, ins.get("image"), "center"))
+            found.append((0, ins.get("first_frame"), "disabled"))
+            found.append((raw_frames - 1, ins.get("last_frame"), "center"))
+            for frame, image, crop in found:
+                name = image_file(image)
+                if name is not None:
+                    out.setdefault(frame, (name, crop))
+            link = ins.get("conditioning", ins.get("positive"))
+    return out
+
+
+def _source_keyframes(cond, video_path, vae, width, height):
+    """`cond` with its single-frame image keyframes encoded again at
+    width x height from the image files they were made from, found through
+    the prompt in the take's sidecar. A refine at a higher resolution then
+    anchors on the original image instead of a low-res keyframe it cannot
+    use. A keyframe whose image cannot be traced is left as it is."""
+    import comfy.utils
+    import nodes
+
+    sidecar = mctx.sidecar_path(video_path)
+    prompt = mctx.read_blob(sidecar, "prompt")
+    if not prompt:
+        return cond
+    images = _keyframe_images(prompt, int(mctx.read_header(sidecar)["raw_frames"]))
+    out = []
+    for tensor, d in cond:
+        kfs = d.get("minimax_keyframes")
+        if not kfs:
+            out.append([tensor, d])
+            continue
+        new = []
+        for kf in kfs:
+            source = images.get(kf["resolved_frame_index"])
+            if source is None or kf.get("latent") is None or kf["latent"].shape[2] != 1:
+                new.append(kf)
+                continue
+            image = nodes.LoadImage().load_image(source[0])[0][:1, :, :, :3].movedim(-1, 1)
+            image = comfy.utils.common_upscale(image, width, height, "lanczos", source[1]).movedim(1, -1)
+            new.append(dict(kf, latent=vae.encode(image)))
+            _LOG.info("obvpm.h3 joint: %s keyframe at frame %d from %s at %dx%d",
+                      os.path.basename(video_path), kf["resolved_frame_index"],
+                      source[0], width, height)
+        out.append([tensor, dict(d, minimax_keyframes=new)])
     return out
 
 
